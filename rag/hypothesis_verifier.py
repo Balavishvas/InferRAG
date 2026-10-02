@@ -172,8 +172,34 @@ Rules:
         except (requests.RequestException, ValueError, json.JSONDecodeError):
             data = {}
 
+        # Small local models occasionally return empty/malformed JSON.
+        # Retry once with an even smaller contract before falling back.
+        if not isinstance(data, dict) or data.get("status") not in {
+            DIRECT, INDIRECT, CONTRADICTED, INSUFFICIENT
+        }:
+            retry_prompt = f"""Verify this claim using only the evidence.
+
+Claim: {claim['claim']}
+
+Evidence:
+{evidence_text}
+
+Return ONLY one JSON object:
+{{"status":"insufficient","supporting_evidence":[],"contradicting_evidence":[],"explanation":"brief reason"}}
+
+Allowed status values: direct_support, indirect_support, contradicted, insufficient.
+direct_support requires explicit statement or logical entailment.
+indirect_support means relevant clues but not enough to establish the claim.
+contradicted requires explicit conflict.
+If unsure, use insufficient.
+"""
+            try:
+                data = _ollama_json(retry_prompt, model, base_url)
+            except (requests.RequestException, ValueError, json.JSONDecodeError):
+                data = {}
+
         allowed = {DIRECT, INDIRECT, CONTRADICTED, INSUFFICIENT}
-        status = data.get("status", INSUFFICIENT)
+        status = data.get("status", INSUFFICIENT) if isinstance(data, dict) else INSUFFICIENT
         if status not in allowed:
             status = INSUFFICIENT
 
@@ -316,9 +342,17 @@ def _aggregate(
         if item["verification"].get("explanation")
     ]
 
-    directness = "direct" if all_core_direct and claims else (
-        "contradicted" if has_contradiction else "indirect"
-    )
+    if has_contradiction:
+        directness = "contradicted"
+    elif claims and all_core_direct:
+        directness = "direct"
+    elif any(
+        item["verification"].get("status") == INDIRECT
+        for item in claim_results
+    ):
+        directness = "indirect"
+    else:
+        directness = "insufficient"
 
     return {
         "hypothesis_index": hypothesis_index,
