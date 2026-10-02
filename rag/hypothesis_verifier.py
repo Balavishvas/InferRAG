@@ -46,6 +46,31 @@ def _ollama_json(prompt: str, model: str, base_url: str) -> dict:
     return _extract_json(response.json().get("response", ""))
 
 
+def _content_words(text: str) -> set[str]:
+    """Return simple content-word tokens for claim drift detection."""
+    stop = {
+        "a", "an", "and", "are", "as", "at", "be", "because", "by", "for",
+        "from", "in", "into", "is", "it", "of", "on", "or", "that", "the",
+        "their", "this", "to", "with", "can", "does", "do", "than", "then",
+        "these", "those", "helps", "help", "useful", "allows", "allow",
+    }
+    return {
+        token for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 2 and token not in stop
+    }
+
+
+def _claim_is_faithful(claim: str, hypothesis: str, question: str) -> bool:
+    """Reject claims that introduce substantial new concepts not in the input."""
+    claim_words = _content_words(claim)
+    if not claim_words:
+        return False
+
+    source_words = _content_words(hypothesis + " " + question)
+    overlap = len(claim_words & source_words) / len(claim_words)
+    return overlap >= 0.35
+
+
 def _extract_claims(
     question: str,
     hypotheses: list[dict],
@@ -107,6 +132,12 @@ Hypotheses:
 
         claim = str(item.get("claim", "")).strip()
         if not claim or h < 1 or h > len(hypotheses):
+            continue
+
+        # The small model can invent extra claims while decomposing a
+        # hypothesis. Reject claims that introduce too many new concepts.
+        hypothesis_text = str(hypotheses[h - 1].get("hypothesis", ""))
+        if not _claim_is_faithful(claim, hypothesis_text, question):
             continue
 
         # Prevent duplicate claims from consuming extra verification calls.
