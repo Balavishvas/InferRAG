@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--max-context-chars", type=int, default=12000)
     parser.add_argument("--model", default="qwen2.5:3b")
     parser.add_argument("--hypotheses", type=int, default=3)
+    parser.add_argument("--claim-top-k", type=int, default=3)
+    parser.add_argument("--claim-candidate-k", type=int, default=10)
     args = parser.parse_args()
 
     rag = RAGPipeline()
@@ -41,7 +43,7 @@ def main():
     print("--- Answer ---")
     print(generate_answer(args.query, contexts, args.model))
 
-    print("\n--- Hypotheses ---")
+    print("\n--- Hypotheses (V4 Claim Verification) ---")
     try:
         hypotheses = generate_hypotheses(
             args.query,
@@ -56,8 +58,10 @@ def main():
             verifications = verify_hypotheses(
                 args.query,
                 hypotheses,
-                contexts,
+                rag_pipeline=rag,
                 model=args.model,
+                claim_top_k=args.claim_top_k,
+                claim_candidate_k=args.claim_candidate_k,
             )
             ranked = rank_hypotheses(hypotheses, verifications)
 
@@ -75,8 +79,12 @@ def main():
                 )
                 print(f"Status: {verification.get('status', 'uncertain')}")
                 print(
-                    "Supporting evidence: "
+                    "Direct evidence: "
                     f"{verification.get('supporting_evidence', [])}"
+                )
+                print(
+                    "Indirect evidence: "
+                    f"{verification.get('indirect_evidence', [])}"
                 )
                 print(
                     "Contradicting evidence: "
@@ -86,10 +94,32 @@ def main():
                     f"Directness: {verification.get('directness', 'unknown')}"
                 )
                 print(
-                    f"Verification score: "
+                    "Verification score (heuristic): "
                     f"{verification.get('verification_score', 0.0)}"
                 )
                 print(f"Verification: {verification.get('explanation', 'N/A')}")
+
+                claim_results = verification.get("claim_results", [])
+                if claim_results:
+                    print("Claims:")
+                    for claim in claim_results:
+                        claim_verification = claim.get("verification", {})
+                        print(
+                            f"  - [{claim.get('importance', 'core')}] "
+                            f"{claim.get('claim', 'N/A')}"
+                        )
+                        print(
+                            f"    Status: "
+                            f"{claim_verification.get('status', 'insufficient')}"
+                        )
+                        print(
+                            f"    Evidence: "
+                            f"{claim_verification.get('supporting_evidence', [])}"
+                        )
+                        print(
+                            f"    Explanation: "
+                            f"{claim_verification.get('explanation', 'N/A')}"
+                        )
     except (ValueError, requests.RequestException) as exc:
         print(f"Hypothesis reasoning failed: {exc}")
 
