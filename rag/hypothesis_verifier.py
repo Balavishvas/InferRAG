@@ -427,6 +427,7 @@ def verify_hypotheses(
 
     verifications = _verify_claims(
         question,
+        hypotheses,
         claims,
         evidence_by_claim,
         model,
