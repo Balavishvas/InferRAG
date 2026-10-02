@@ -2,10 +2,10 @@ def rank_hypotheses(
     hypotheses: list[dict],
     verifications: list[dict],
 ) -> list[dict]:
-    """Combine generation and verification metadata for final ordering.
+    """Rank hypotheses using conservative verification status and score.
 
-    Verification status is the primary signal. Scores are only heuristic
-    signals and must not be interpreted as calibrated probabilities.
+    Verification scores are deterministic heuristic evidence-strength scores,
+    not calibrated probabilities.
     """
     verification_by_index = {
         int(item.get("hypothesis_index", 0)): item
@@ -16,7 +16,7 @@ def rank_hypotheses(
     status_weight = {
         "supported": 3,
         "uncertain": 2,
-        "contradicted": 1,
+        "contradicted": 0,
     }
 
     ranked = []
@@ -28,7 +28,7 @@ def rank_hypotheses(
         ranked.append({
             **hypothesis,
             "verification": verification,
-            "_rank": status_weight.get(status, 0) + score,
+            "_rank": status_weight.get(status, 1) + score,
         })
 
     ranked.sort(key=lambda item: item["_rank"], reverse=True)
