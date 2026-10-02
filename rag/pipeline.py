@@ -4,6 +4,7 @@ import json
 from .chunker import chunk_text
 from .embeddings import Embedder
 from .loader import load_document
+from .reranker import Reranker
 from .vector_store import VectorStore
 
 
@@ -11,10 +12,13 @@ class RAGPipeline:
     def __init__(
         self,
         embedding_model: str = "all-MiniLM-L6-v2",
+        reranker_model: str = "BAAI/bge-reranker-base",
         index_root: str = "data/index",
     ):
         self.embedder = Embedder(embedding_model)
+        self.reranker = Reranker(reranker_model)
         self.embedding_model = embedding_model
+        self.reranker_model = reranker_model
         self.index_root = Path(index_root)
         self.store = None
         self.document_path = None
@@ -22,7 +26,13 @@ class RAGPipeline:
     def _index_dir(self, path: str) -> Path:
         return self.index_root / Path(path).stem
 
-    def _metadata_matches(self, directory: Path, path: str, chunk_size: int, overlap: int) -> bool:
+    def _metadata_matches(
+        self,
+        directory: Path,
+        path: str,
+        chunk_size: int,
+        overlap: int,
+    ) -> bool:
         try:
             metadata = VectorStore.load_metadata(str(directory))
         except (FileNotFoundError, json.JSONDecodeError):
@@ -75,8 +85,13 @@ class RAGPipeline:
         )
         return len(chunks)
 
-    def retrieve(self, question: str, top_k: int = 5):
+    def retrieve_candidates(self, question: str, candidate_k: int = 20):
         if self.store is None:
             raise RuntimeError("Ingest a document before retrieving.")
+
         query_embedding = self.embedder.encode([question])[0]
-        return self.store.search(query_embedding, top_k)
+        return self.store.search(query_embedding, candidate_k)
+
+    def retrieve(self, question: str, top_k: int = 5, candidate_k: int = 20):
+        candidates = self.retrieve_candidates(question, candidate_k)
+        return self.reranker.rerank(question, candidates, top_k=top_k)
