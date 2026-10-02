@@ -1,7 +1,11 @@
 import argparse
 
+import requests
+
 from rag.context_selector import select_context
 from rag.hypothesis import generate_hypotheses
+from rag.hypothesis_ranker import rank_hypotheses
+from rag.hypothesis_verifier import verify_hypotheses
 from rag.llm import generate_answer
 from rag.pipeline import RAGPipeline
 
@@ -37,7 +41,7 @@ def main():
     print("--- Answer ---")
     print(generate_answer(args.query, contexts, args.model))
 
-    print("\n--- Hypotheses (unverified) ---")
+    print("\n--- Hypotheses ---")
     try:
         hypotheses = generate_hypotheses(
             args.query,
@@ -49,23 +53,45 @@ def main():
         if not hypotheses:
             print("No hypotheses generated.")
         else:
-            for i, hypothesis in enumerate(hypotheses, 1):
+            verifications = verify_hypotheses(
+                args.query,
+                hypotheses,
+                contexts,
+                model=args.model,
+            )
+            ranked = rank_hypotheses(hypotheses, verifications)
+
+            for i, hypothesis in enumerate(ranked, 1):
+                verification = hypothesis.get("verification", {})
                 print(f"\n[{i}] {hypothesis.get('hypothesis', 'N/A')}")
                 print(f"Reasoning: {hypothesis.get('reasoning', 'N/A')}")
                 print(
-                    "Supporting evidence: "
+                    "Generation evidence: "
                     f"{hypothesis.get('supporting_evidence', [])}"
                 )
                 print(
                     "Missing evidence: "
                     f"{hypothesis.get('missing_evidence', [])}"
                 )
+                print(f"Status: {verification.get('status', 'uncertain')}")
                 print(
-                    "Preliminary plausibility: "
-                    f"{hypothesis.get('preliminary_plausibility', 'N/A')}"
+                    "Supporting evidence: "
+                    f"{verification.get('supporting_evidence', [])}"
                 )
+                print(
+                    "Contradicting evidence: "
+                    f"{verification.get('contradicting_evidence', [])}"
+                )
+                print(
+                    f"Directness: {verification.get('directness', 'unknown')}"
+                )
+                print(
+                    f"Verification score: "
+                    f"{verification.get('verification_score', 0.0)}"
+                )
+                print(f"Verification: {verification.get('explanation', 'N/A')}")
     except (ValueError, requests.RequestException) as exc:
-        print(f"Hypothesis generation failed: {exc}")
+        print(f"Hypothesis reasoning failed: {exc}")
 
     print("\n--- Evidence ---")
     for i, item in enumerate(contexts, 1):
