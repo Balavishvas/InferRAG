@@ -121,13 +121,20 @@ Hypotheses:
     return cleaned
 
 
-def _verify_claims(
+def _verify_hypothesis_claims(
     question: str,
+    hypothesis_index: int,
+    hypothesis: str,
     claims: list[dict],
     evidence_by_claim: dict[str, list[dict]],
     model: str,
     base_url: str,
 ) -> list[dict]:
+    """Verify one hypothesis at a time.
+
+    Keeping one hypothesis per model call makes the JSON contract much smaller
+    and substantially reduces cross-index errors on small local models.
+    """
     blocks = []
 
     for claim in claims:
@@ -140,45 +147,43 @@ def _verify_claims(
         ) or "[No evidence retrieved]"
 
         blocks.append(
-            f"[Claim {key}] hypothesis_index={claim['hypothesis_index']} "
-            f"claim_index={claim['claim_index']}\n"
-            f"Claim: {claim['claim']}\n"
-            f"Importance: {claim['importance']}\n"
-            f"Claim-specific evidence:\n{evidence_text}"
+            f"[Claim {claim['claim_index']}]"
+            f"\nClaim: {claim['claim']}"
+            f"\nImportance: {claim['importance']}"
+            f"\nEvidence:\n{evidence_text}"
         )
 
-    prompt = f"""You are the strict claim-verification component of InferRAG.
+    prompt = f"""You are the strict evidence verifier for InferRAG.
 
-Verify each claim using ONLY the claim-specific evidence supplied below.
+Verify ONLY the claims for this ONE hypothesis using ONLY the supplied
+claim-specific evidence.
 
-This distinction is critical:
-- direct_support: the evidence explicitly states the claim or logically entails it.
-- indirect_support: the evidence is relevant or provides clues, but does NOT
-  establish the claim.
-- contradicted: the evidence explicitly conflicts with the claim.
-- insufficient: the evidence does not establish or contradict the claim.
+Status definitions:
+- direct_support: evidence explicitly states the claim or logically entails it.
+- indirect_support: evidence is relevant or gives clues, but does NOT establish it.
+- contradicted: evidence explicitly conflicts with the claim.
+- insufficient: evidence neither establishes nor contradicts it.
 
 Rules:
-- Mere topic overlap is NOT direct support.
-- Mentioning related concepts is NOT direct support.
+- Topic overlap is NOT direct support.
+- Related concepts are NOT direct support.
 - Absence of evidence is NOT contradiction.
-- Do not use outside knowledge.
-- If uncertain, choose indirect_support or insufficient rather than direct_support.
-- Cite evidence numbers from the claim's own evidence block only.
-- Give a short explanation.
-- Do NOT provide a numeric confidence probability.
+- Never use outside knowledge.
+- If uncertain, prefer indirect_support or insufficient.
+- Use only evidence numbers belonging to that claim.
+- Return exactly one verification for every claim.
+- Keep explanations short.
+- Do not return confidence probabilities.
 
-Return ONLY valid JSON:
+Return ONLY JSON in exactly this shape:
 {{
   "verifications": [
     {{
-      "hypothesis_index": 1,
       "claim_index": 1,
       "status": "direct_support",
       "supporting_evidence": [1],
       "contradicting_evidence": [],
-      "explanation": "The passage explicitly states ...",
-      "directness": "direct"
+      "explanation": "Short evidence-based explanation."
     }}
   ]
 }}
@@ -186,43 +191,112 @@ Return ONLY valid JSON:
 Question:
 {question}
 
-Claims and claim-specific evidence:
+Hypothesis:
+{hypothesis}
+
+Claims:
 {chr(10).join(blocks)}
 """
 
-    data = _ollama_json(prompt, model, base_url)
+    try:
+        data = _ollama_json(prompt, model, base_url)
+    except (requests.RequestException, ValueError, json.JSONDecodeError):
+        return []
+
     verifications = data.get("verifications", [])
     if not isinstance(verifications, list):
-        raise ValueError("Model response contains an invalid verifications list.")
+        return []
 
     allowed = {DIRECT, INDIRECT, CONTRADICTED, INSUFFICIENT}
+    expected = {int(c["claim_index"]) for c in claims}
     cleaned = []
 
     for item in verifications:
         try:
-            h = int(item.get("hypothesis_index"))
-            c = int(item.get("claim_index"))
+            claim_index = int(item.get("claim_index"))
         except (TypeError, ValueError):
+            continue
+
+        if claim_index not in expected:
             continue
 
         status = item.get("status", INSUFFICIENT)
         if status not in allowed:
             status = INSUFFICIENT
 
+        def _evidence_numbers(value):
+            if not isinstance(value, list):
+                return []
+            result = []
+            for number in value:
+                try:
+                    number = int(number)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    result.append(number)
+            return sorted(set(result))
+
         cleaned.append({
-            "hypothesis_index": h,
-            "claim_index": c,
+            "hypothesis_index": hypothesis_index,
+            "claim_index": claim_index,
             "status": status,
-            "supporting_evidence": item.get("supporting_evidence", []),
-            "contradicting_evidence": item.get("contradicting_evidence", []),
+            "supporting_evidence": _evidence_numbers(
+                item.get("supporting_evidence", [])
+            ),
+            "contradicting_evidence": _evidence_numbers(
+                item.get("contradicting_evidence", [])
+            ),
             "explanation": str(item.get("explanation", "")).strip(),
-            "directness": item.get(
-                "directness",
-                "direct" if status == DIRECT else "indirect",
+            "directness": (
+                "direct"
+                if status == DIRECT
+                else "contradicted"
+                if status == CONTRADICTED
+                else "indirect"
             ),
         })
 
-    return cleaned
+    # One result per claim. Duplicate model outputs are reduced deterministically.
+    by_claim = {}
+    for item in cleaned:
+        by_claim[item["claim_index"]] = item
+
+    return [by_claim[i] for i in sorted(by_claim)]
+
+
+def _verify_claims(
+    question: str,
+    hypotheses: list[dict],
+    claims: list[dict],
+    evidence_by_claim: dict[str, list[dict]],
+    model: str,
+    base_url: str,
+) -> list[dict]:
+    """Verify each hypothesis separately for a smaller, more reliable prompt."""
+    all_verifications = []
+
+    for hypothesis_index, hypothesis in enumerate(hypotheses, 1):
+        hypothesis_claims = [
+            claim for claim in claims
+            if claim["hypothesis_index"] == hypothesis_index
+        ]
+        if not hypothesis_claims:
+            continue
+
+        all_verifications.extend(
+            _verify_hypothesis_claims(
+                question,
+                hypothesis_index,
+                str(hypothesis.get("hypothesis", "")),
+                hypothesis_claims,
+                evidence_by_claim,
+                model,
+                base_url,
+            )
+        )
+
+    return all_verifications
 
 
 def _aggregate(
