@@ -87,22 +87,10 @@ def test_single_hypothesis_verification_filters_invalid_claims(monkeypatch):
 
     def fake_ollama(prompt, model, base_url):
         return {
-            "verifications": [
-                {
-                    "claim_index": 1,
-                    "status": DIRECT,
-                    "supporting_evidence": [1],
-                    "contradicting_evidence": [],
-                    "explanation": "The evidence explicitly states the claim.",
-                },
-                {
-                    "claim_index": 99,
-                    "status": DIRECT,
-                    "supporting_evidence": [1],
-                    "contradicting_evidence": [],
-                    "explanation": "Invalid claim.",
-                },
-            ]
+            "status": DIRECT,
+            "supporting_evidence": [1],
+            "contradicting_evidence": [],
+            "explanation": "The evidence explicitly states the claim.",
         }
 
     monkeypatch.setattr(hv, "_ollama_json", fake_ollama)
@@ -152,4 +140,29 @@ def test_single_hypothesis_verification_failure_returns_empty(monkeypatch):
         base_url="http://localhost:11434",
     )
 
-    assert result == []
+    assert len(result) == 1
+    assert result[0]["status"] == "insufficient"
+    assert result[0]["explanation"] == "The available evidence is insufficient to verify the claim."
+
+
+def test_direct_support_allows_clear_paraphrase():
+    claims = [{
+        "hypothesis_index": 1,
+        "claim_index": 1,
+        "claim": "Semantic splitting breaks a complex query into sub-topics.",
+        "importance": "core",
+    }]
+    result = _aggregate(1, claims, [verification(DIRECT, support=[1])])
+    assert result["status"] == "supported"
+    assert result["directness"] == "direct"
+
+
+def test_insufficient_never_reports_indirect():
+    claims = [{
+        "hypothesis_index": 1,
+        "claim_index": 1,
+        "claim": "Unknown claim.",
+        "importance": "core",
+    }]
+    result = _aggregate(1, claims, [verification("insufficient")])
+    assert result["directness"] == "insufficient"
