@@ -63,13 +63,14 @@ Break each hypothesis into the smallest factual or inferential claims that
 must be checked against the source document.
 
 Rules:
-- Use ONLY the wording of each hypothesis and the question.
-- Do not add outside facts.
+- Use ONLY information already expressed by the hypothesis and question.
+- Do not invent new benefits, mechanisms, metrics, causes, or conclusions.
+- Preserve the hypothesis meaning; do not make a claim stronger than the hypothesis.
 - Prefer 1-3 atomic claims per hypothesis.
-- A claim should be independently verifiable from evidence.
-- Preserve the hypothesis meaning.
-- Mark each claim as "core" or "supporting". Core claims are necessary for
-  the hypothesis to be true.
+- A claim must be independently verifiable from evidence.
+- Mark each claim as "core" or "supporting".
+- Core claims are necessary for the hypothesis to be true.
+- Supporting claims explain or qualify the hypothesis but are not necessary.
 
 Return ONLY valid JSON:
 {{
@@ -96,6 +97,7 @@ Hypotheses:
         raise ValueError("Model response contains an invalid claims list.")
 
     cleaned = []
+    seen = set()
     for item in claims:
         try:
             h = int(item.get("hypothesis_index"))
@@ -106,6 +108,12 @@ Hypotheses:
         claim = str(item.get("claim", "")).strip()
         if not claim or h < 1 or h > len(hypotheses):
             continue
+
+        # Prevent duplicate claims from consuming extra verification calls.
+        key = (h, claim.lower())
+        if key in seen:
+            continue
+        seen.add(key)
 
         importance = item.get("importance", "core")
         if importance not in {"core", "supporting"}:
@@ -118,7 +126,35 @@ Hypotheses:
             "importance": importance,
         })
 
-    return cleaned
+    # Keep claim indices contiguous for deterministic evidence lookup/output.
+    by_hypothesis = {}
+    for item in cleaned:
+        by_hypothesis.setdefault(item["hypothesis_index"], []).append(item)
+
+    normalized = []
+    for h, items in by_hypothesis.items():
+        for index, item in enumerate(items, 1):
+            item["claim_index"] = index
+            normalized.append(item)
+
+    return normalized
+
+def _clean_explanation(value) -> str:
+    """Remove common small-model placeholder/garbage explanations."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    placeholders = {
+        "brief reason",
+        "brief reason brief reason",
+        "reason",
+        "n/a",
+        "none",
+    }
+    if lowered in placeholders:
+        return ""
+    return text
 
 
 def _verify_hypothesis_claims(
@@ -143,7 +179,9 @@ def _verify_hypothesis_claims(
             for i, item in enumerate(evidence, 1)
         ) or "[No evidence retrieved]"
 
-        prompt = f"""You verify ONE claim for InferRAG.
+        prompt = f"""You are InferRAG's evidence verifier.
+
+Verify ONE claim against ONLY the supplied evidence.
 
 Question: {question}
 Hypothesis: {hypothesis}
@@ -152,53 +190,64 @@ Claim: {claim['claim']}
 Evidence:
 {evidence_text}
 
-Choose exactly one status:
-direct_support = evidence explicitly states the claim or logically entails it.
-indirect_support = evidence is related but does not establish the claim.
-contradicted = evidence explicitly conflicts with the claim.
-insufficient = evidence is not enough either way.
+Choose exactly one:
+- direct_support: the evidence explicitly states the claim OR logically entails
+  the same proposition using clear paraphrase/synonym/terminology differences.
+- indirect_support: the evidence is relevant and suggests the claim, but does
+  not establish the proposition.
+- contradicted: the evidence explicitly conflicts with the claim.
+- insufficient: the evidence cannot establish or contradict the claim.
 
-Rules:
-- Do not use outside knowledge.
-- Topic overlap is not direct support.
+Important:
+- Do NOT reject direct support merely because the source uses different words.
+  Example: "semantic splitting" can be directly supported by "breaking a query
+  into sub-topics" when the surrounding evidence describes that exact operation.
+- Do NOT treat merely related concepts as direct support.
+- Do NOT add outside knowledge.
 - Absence of evidence is not contradiction.
-- Be conservative.
-- Return ONLY this JSON object and nothing else:
+- A direct_support or contradicted result MUST cite at least one evidence item.
+- Be conservative about benefits, causality, metrics, and performance claims.
+
+Return ONLY this JSON object:
 {{"status":"insufficient","supporting_evidence":[],"contradicting_evidence":[],"explanation":"brief reason"}}
 """
 
+        data = {}
         try:
             data = _ollama_json(prompt, model, base_url)
         except (requests.RequestException, ValueError, json.JSONDecodeError):
             data = {}
 
-        # Small local models occasionally return empty/malformed JSON.
-        # Retry once with an even smaller contract before falling back.
-        if not isinstance(data, dict) or data.get("status") not in {
-            DIRECT, INDIRECT, CONTRADICTED, INSUFFICIENT
-        }:
-            retry_prompt = f"""Verify this claim using only the evidence.
+        allowed = {DIRECT, INDIRECT, CONTRADICTED, INSUFFICIENT}
 
-Claim: {claim['claim']}
+        # Retry once with a shorter prompt. This specifically targets Qwen's
+        # occasional empty/partial JSON responses.
+        status = data.get("status") if isinstance(data, dict) else None
+        if status not in allowed:
+            retry_prompt = f"""Check this claim using only the evidence.
 
-Evidence:
+CLAIM:
+{claim['claim']}
+
+EVIDENCE:
 {evidence_text}
 
-Return ONLY one JSON object:
-{{"status":"insufficient","supporting_evidence":[],"contradicting_evidence":[],"explanation":"brief reason"}}
+Rules:
+direct_support = evidence explicitly states or logically entails the claim,
+including clear paraphrases.
+indirect_support = relevant but not enough.
+contradicted = evidence explicitly conflicts.
+insufficient = cannot tell.
+No outside knowledge. Direct/contradicted requires cited evidence.
 
-Allowed status values: direct_support, indirect_support, contradicted, insufficient.
-direct_support requires explicit statement or logical entailment.
-indirect_support means relevant clues but not enough to establish the claim.
-contradicted requires explicit conflict.
-If unsure, use insufficient.
+Return ONLY JSON:
+{{"status":"insufficient","supporting_evidence":[],"contradicting_evidence":[],"explanation":"reason"}}
 """
             try:
                 data = _ollama_json(retry_prompt, model, base_url)
             except (requests.RequestException, ValueError, json.JSONDecodeError):
                 data = {}
 
-        allowed = {DIRECT, INDIRECT, CONTRADICTED, INSUFFICIENT}
         status = data.get("status", INSUFFICIENT) if isinstance(data, dict) else INSUFFICIENT
         if status not in allowed:
             status = INSUFFICIENT
@@ -216,32 +265,45 @@ If unsure, use insufficient.
                     out.append(n)
             return sorted(set(out))
 
-        explanation = str(data.get("explanation", "")).strip()
+        supporting = _numbers(data.get("supporting_evidence", []))
+        contradicting = _numbers(data.get("contradicting_evidence", []))
+
+        # Never allow a model to claim direct/contradicted without an actual
+        # cited passage. This is a deterministic safety rail.
+        if status == DIRECT and not supporting:
+            status = INSUFFICIENT
+        elif status == CONTRADICTED and not contradicting:
+            status = INSUFFICIENT
+
+        explanation = _clean_explanation(
+            data.get("explanation", "") if isinstance(data, dict) else ""
+        )
         if not explanation:
-            explanation = (
-                "No verification was returned for this claim."
-                if not data
-                else "The verifier did not provide a usable explanation."
-            )
+            if status == DIRECT:
+                explanation = "The cited evidence directly supports the claim."
+            elif status == CONTRADICTED:
+                explanation = "The cited evidence contradicts the claim."
+            elif status == INDIRECT:
+                explanation = "The cited evidence is relevant but does not fully establish the claim."
+            else:
+                explanation = "The available evidence is insufficient to verify the claim."
 
         results.append({
             "hypothesis_index": hypothesis_index,
             "claim_index": claim_index,
             "status": status,
-            "supporting_evidence": _numbers(data.get("supporting_evidence", [])),
-            "contradicting_evidence": _numbers(
-                data.get("contradicting_evidence", [])
-            ),
+            "supporting_evidence": supporting,
+            "contradicting_evidence": contradicting,
             "explanation": explanation,
             "directness": (
                 "direct" if status == DIRECT
                 else "contradicted" if status == CONTRADICTED
-                else "indirect"
+                else "indirect" if status == INDIRECT
+                else "insufficient"
             ),
         })
 
     return results
-
 
 def _verify_claims(
     question: str,
